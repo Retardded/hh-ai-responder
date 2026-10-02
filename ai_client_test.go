@@ -149,8 +149,8 @@ func TestResumeTextAcceptsBothShapes(t *testing.T) {
 func TestLetterLengthPenalty(t *testing.T) {
 	cases := map[int]int{
 		300: letterMinChars - 300,
-		550: 0,
-		700: 700 - letterMaxChars,
+		700: 0,
+		900: 900 - letterMaxChars,
 	}
 	for n, want := range cases {
 		if got := letterLengthPenalty(strings.Repeat("я", n)); got != want {
