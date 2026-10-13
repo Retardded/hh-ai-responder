@@ -27,6 +27,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 const (
@@ -1075,7 +1076,6 @@ type ChatToReply struct {
 	VacancyURL          string
 	CompanyName         string
 	VacancyCompensation string
-	ReplyOptions        []string
 	ResumeID            int64
 	ResumeHash          string
 	ResumeTitle         string
@@ -1171,20 +1171,12 @@ func (r *HHAIResponder) getChatsAwaitingReply(maxPages int) ([]ChatToReply, erro
 				continue
 			}
 
-			var options []string
-			if chat.LastMessage.Actions != nil {
-				for _, button := range chat.LastMessage.Actions.TextButtons {
-					options = append(options, button.Text)
-				}
-			}
-
 			// В принципе можно сделать общение во всех чатах, но сейчас под резюме
 			// сделано
 			chatInfo := ChatToReply{
 				ChatId:              chat.Id,
 				ContactName:         last.ParticipantDisplay.Name,
 				ReplyToMessage:      last.Text,
-				ReplyOptions:        options,
 				VacancyName:         vacancy.Name,
 				VacancyURL:          vacancy.Links.Desktop,
 				CompanyName:         vacancy.Company.Name,
@@ -1213,6 +1205,21 @@ func (r *HHAIResponder) getChatsAwaitingReply(maxPages int) ([]ChatToReply, erro
 }
 
 // ===== Auto Chat Responder =====
+
+// isAIAssistant сравнивает целые слова имени, чтобы «работа» не считалось «бот»
+func isAIAssistant(name string) bool {
+	words := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return !unicode.IsLetter(r)
+	})
+	for _, w := range words {
+		switch w {
+		case "ии", "ai", "бот", "робот", "помощник":
+			return true
+		}
+	}
+	return false
+}
+
 func JoinChatMessages(response *ChatDataResponse) string {
 	var sb strings.Builder
 	items := response.Chat.Messages.Items
@@ -1276,34 +1283,21 @@ func (r *HHAIResponder) AutoRespondChats() error {
 			chatToReply.ResumeExperience,
 		)
 
-		var temperature = 0.5
+		temperature := 0.5
 		userPrompt := "Сообщение работодателя:\n\n" + strings.TrimSpace(chatToReply.ReplyToMessage) + "\n---\n"
-		if len(chatToReply.ReplyOptions) > 0 {
-			temperature = 0.1
-			userPrompt += fmt.Sprintf(
-				`
-Тебе нужно ответить на этот вопрос строго одним из предложенных вариантов.
-Не нужно изменять текст варианта, добавлять какие-либо лишние символы в ответ.
+		chatDataResponse, err := r.GetChatData(chatToReply.ChatId, chatToReply.ApplicantId)
+		if err != nil {
+			logger.Warn("Can't load messages from chat #%d: %v", chatToReply.ChatId, err)
+			continue
+		}
+		// Свинья запретила ей писать
+		if !chatDataResponse.ChatStates.WriteMessageState.Allowed || len(chatDataResponse.Chat.Messages.Items) >= 20 {
+			logger.Debug("Ignore chat #%d", chatDataResponse.Chat.ID)
+			r.ignoredChats = append(r.ignoredChats, chatToReply.ChatId)
+			continue
+		}
 
-Варианты ответа:
-
-%s`,
-				"- "+strings.Join(chatToReply.ReplyOptions, "\n - "),
-			)
-		} else {
-			chatDataResponse, err := r.GetChatData(chatToReply.ChatId, chatToReply.ApplicantId)
-			if err != nil {
-				logger.Warn("Can't load messages from chat #%d: %v", chatToReply.ChatId, err)
-				continue
-			}
-			// Свинья запретила ей писать
-			if !chatDataResponse.ChatStates.WriteMessageState.Allowed || len(chatDataResponse.Chat.Messages.Items) >= 20 {
-				logger.Debug("Ignore chat #%d", chatDataResponse.Chat.ID)
-				r.ignoredChats = append(r.ignoredChats, chatToReply.ChatId)
-				continue
-			}
-
-			userPrompt += fmt.Sprintf(`
+		userPrompt += fmt.Sprintf(`
 Название вакансии: %s
 Зарплата: %s
 Компания: %s
@@ -1323,9 +1317,8 @@ func (r *HHAIResponder) AutoRespondChats() error {
    - Если сумма больше, то это месячная компенсация.
    - В конце ответа пиши, что оплата зависит от нагрузки и может быть скорректирована как в меньшую так и большую сторону.
 7. Если сообщение работодателя не предполагает ответа, то отвечай как-то однословно, например, ок, хорошо либо точкой и т.п.`, chatToReply.VacancyName, chatToReply.VacancyCompensation, chatToReply.CompanyName, chatToReply.ContactName, defaultGithubURL)
-			chatHistory := JoinChatMessages(chatDataResponse)
-			userPrompt += "История переписки:\n\n" + chatHistory
-		}
+		chatHistory := JoinChatMessages(chatDataResponse)
+		userPrompt += "История переписки:\n\n" + chatHistory
 
 		if strings.TrimSpace(r.contacts) != "" {
 			userPrompt += "\n\nТвои контакты: " + r.contacts
@@ -1333,6 +1326,11 @@ func (r *HHAIResponder) AutoRespondChats() error {
 
 		if strings.TrimSpace(r.extraChatReplyPrompt) != "" {
 			userPrompt += "\n\nДополнительные инструкции:\n\n" + r.extraChatReplyPrompt
+		}
+
+		// Вопросы ИИ-помощника — это квиз, на них отвечаем коротко и по делу
+		if isAIAssistant(chatToReply.ContactName) {
+			userPrompt += "\n\nЭто ИИ-помощник работодателя. Отвечай коротко: одно-два предложения, сразу по сути вопроса."
 		}
 
 		reply, err := r.ai.Chat(systemPrompt, userPrompt, 512, temperature)
